@@ -1,0 +1,8 @@
+line-length = 500
+indent-width = 2
+
+[format]
+quote-style = "double"
+indent-style = "space"
+
+
