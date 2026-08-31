@@ -12,6 +12,9 @@ from typing import Any, List, Optional, Self, Tuple, Union
 
 try: import uno
 except ImportError: uno = None
+from io import StringIO
+from contextlib import redirect_stdout
+
 
 class LibreOfficeError(Exception):
   """Базовий виняток LibreOffice."""
@@ -1057,6 +1060,9 @@ class Output:
       print("raise ValueError")
       name = self.pretty_names[name]
     print(name, "= ", end="")
+    if isdef:
+      print(format,units)
+      return
     if vars:
       for var in vars:
         n = var[0]
@@ -1064,83 +1070,74 @@ class Output:
           var[0] = self.pretty_names[n]
       print(format.format(*[v[0] for v in vars]), end=" = ")
       print(format.format(*[self.fmt(v[1]) for v in vars]), end=" = ")
-      print(self.fmt(target[1]), f"{units}")
-    else:
-      if isdef:
-        print(format, end=" = ")
-      print(self.fmt(target[1]), f"{units}")
+    print(self.fmt(target[1]), f"{units}")
 
-  def lp(self, target: list, units: str = "", format: str = "", vars: None | list[list] = None, isdef=False) -> None:
-    from io import StringIO
-    from contextlib import redirect_stdout
-
+  def lp(self, target: list, units: str = "", format: str = "", vars: None | list[list] = None, isdef=False, para_break: bool = True) -> None:
     buf = StringIO()
-    with redirect_stdout(buf):
-      self.print(target, units, format, vars, isdef)
+    with redirect_stdout(buf): self.print(target, units, format, vars, isdef)
     res = buf.getvalue()
-    assert self.office
-    self.office.formula(res)
+    self.office.formula(res,para_break)
   def nl(self):
     assert self.office
     self.office.paragraph("")
 
+#@#
 OPERATORS = {
   "**": "^",
   "*": "cdot",
   "/": "over",
 }
 
-with open(sys.argv[1]) as targetfile:
+def tokenise(line:str):
+  m, *args = line.strip().split('#')
+  tokens = [
+    [m.lastgroup, m.group()]
+    for m in re.compile(
+      r"(?P<COMPLEX>\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\s*[+-]\s*\d+(?:\.\d+)?(?:[eE][+-]?\d+)?j)"
+      r"|(?P<NUM>\d+(?:\.\d+)?(?:[eE][+-]?\d+)?j?)"
+      r"|(?P<LIT>[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)"
+      r"|(?P<OP>\*\*|[+\-*/])"
+      r"|(?P<LP>\()|(?P<RP>\))|(?P<EQ>=)|(?P<COMMA>,)|(?P<SKIP>\s+)"
+    ).finditer(m)
+    if m.lastgroup != "SKIP"
+  ] if m != '' else []
+  return tokens, args
 
-  with open(sys.argv[0]) as sourcefile:
-    for l in sourcefile:
-      if l.startswith("with"): break
-      if l == '\n': continue
-      print(l, end="")
+def isexprclosed(toks):
+  toks = [t[0] for t in toks]
+  return toks.count("LP") - toks.count("RP")
 
-  runarg = 2 if "--pdf" in sys.argv else 1 if "--office" in sys.argv else 0
-  print(f"o = Output({runarg})")
-
-  tmp_toks = []
+def mainloop(targetfile):
+  lbuffer = ""
+  abuffer = []
   for line in targetfile:
-    if line.startswith("#\\n"): print("o.nl()" if runarg!=0 else "print()"); continue
-    else: print(line, end="")
+    indentlevel = 0
+    for l in line:
+      if l not in ' \t\n': break
+      indentlevel += 1 
+    if line.strip().startswith("#\\n"): print(f'{" "*indentlevel}{"o.nl()" if runarg!=0 else "print()"}'); continue
 
-    if line == "\n" or line.startswith(("from", "import")): continue
+    if line.strip().startswith(("from","import","for","while")): 
+      print(line,end='')
+      continue
+    if line == "\n": continue
+    # args: noname, nobody, nonum
+    tokens,args = tokenise(lbuffer + line)
 
-    u = "''"
-    if '#' in line:
-      line,args = line.strip().split('#')
-      a = args.split()
-      for arg in a:
-        if arg.startswith('@'):
-          """
-          @: some sys args, f.e.: 
-            @nobody
-            @onlybody
-            @novar
-          """
-          assert False
-        elif arg.startswith('!'):
-          u = arg
-        else:
-          u = "'"+arg+"'"
-          break
-    tokens = [
-      [m.lastgroup, m.group()]
-      for m in re.compile(
-        r"(?P<NUM>\d+(?:\.\d+)?(?:[eE][+-]?\d+)?j?)"
-        r"|(?P<LIT>[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)"
-        r"|(?P<OP>\*\*|[+\-*/])"
-        r"|(?P<LP>\()|(?P<RP>\))|(?P<EQ>=)|(?P<COMMA>,)|(?P<SKIP>\s+)"
-      ).finditer(line)
-      if m.lastgroup != "SKIP"
-    ]
+    if isexprclosed(tokens):
+      lbuffer = "".join([lbuffer,line.split('#')[0]])
+      abuffer += args
+      continue
+    print(lbuffer+line,end='')
+    args = " ".join(abuffer+args)
+
+    lbuffer = ""
+    abuffer = []
     tokens_len = len(tokens)
     name = ""
     format = ""
     vars = ""
-    isdef = "OP" not in [v[1] for v in tokens]
+    isdef = "OP" not in [v[0] for v in tokens]
     isFuncCall = lambda: tokens_len > i + 1 and tokens[i + 1][0] == "LP"
     for i, tok in enumerate(tokens):
       if i == 0:
@@ -1209,9 +1206,22 @@ with open(sys.argv[1]) as targetfile:
         format += tok[1]
       elif tok[0] == "RP":
         format += tok[1]
+    if name in [v[1] for v in tokens[2:]]: raise NameError("Операції накшталт x = x + 1 недопустимі, через недійсність виводу")
+    print(f"{' '*indentlevel}o.{'lp' if("--office" in sys.argv or "--pdf" in sys.argv) else 'print'}"
+          f"(['{name}',{name}],'{args}','{format}',[{vars}],{isdef},{not '@nobreak' in args})")
 
-    print(f"o.{'lp' if("--office" in sys.argv or "--pdf" in sys.argv) else 'print'}"
-      f"(['{name}',{name}],{u},'{format}',[{vars}],{isdef})")
+def insertheader():
+  with open(sys.argv[0]) as sourcefile:
+    for l in sourcefile:
+      if l.startswith("#@#"): break
+      if l == '\n': continue
+      print(l, end="")
+
+with open(sys.argv[1]) as targetfile:
+  insertheader()
+  runarg = 2 if "--pdf" in sys.argv else 1 if "--office" in sys.argv else 0
+  print(f"o = Output({runarg})")
+  mainloop(targetfile)
 
   if runarg != 0:
     print("o.office.fin()")
